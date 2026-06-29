@@ -1,4 +1,4 @@
-﻿from flask import Flask, render_template, request, jsonify, abort
+from flask import Flask, render_template, request, jsonify, abort
 from flask_cors import CORS
 import requests
 import json
@@ -509,6 +509,43 @@ def get_next_empty_row(sheet_id, start_from=2, max_batches=4):
     return default_row
 
 
+def _find_first_empty_row_in_column_a():
+    """提交排队时实时扫描A列，找到第一个真正的空行（1-based）
+    不使用缓存，每次都是最新数据，避免多人并发时返回同一行号导致覆盖"""
+    batch_size = 200
+    for offset in range(0, 2000, batch_size):
+        start = offset + 1  # 1-based
+        end = offset + batch_size
+        range_str = f"A{start}:A{end}"
+        grid_data = read_sheet_range(SHEET_ID, range_str)
+        rows = grid_data.get("rows", [])
+
+        if not rows:
+            break
+
+        for i in range(len(rows)):
+            row = rows[i]
+            actual_row = start + i
+            if actual_row < 2:
+                continue
+            has_data = False
+            for v in row.get("values", []):
+                cv = v.get("cellValue")
+                if cv:
+                    text = parse_cell_value(cv)
+                    if text.strip():
+                        has_data = True
+                        break
+            if not has_data:
+                return actual_row
+
+        if len(rows) < batch_size:
+            # 到达表格末尾，下一行是空行
+            return start + len(rows)
+
+    return None  # 表格已满，需要扩容
+
+
 def batch_update(requests_body):
     """执行批量更新操作"""
     url = f"{BASE_URL}/files/{FILE_ID}/batchUpdate"
@@ -656,9 +693,8 @@ def read_calculated_date_from_row(row_index_1based):
 
 def _find_user_temp_row_in_sheet(submitter_id):
     """扫描腾讯表格，查找该用户的临时行（Render重启后内存缓存丢失时的兜底）
-    条件：A列有值（型号），F列为空（未提交排队）
-    优化：一次性读取A:F列，避免逐行API调用
-    """
+    条件：A列有值（型号），K列为空或为该用户ID（未提交排队），F列为空
+    优化：一次性读取A:F,K列，避免逐行API调用；按submitter_id过滤"""
     if not submitter_id:
         return 0
     try:
@@ -666,8 +702,8 @@ def _find_user_temp_row_in_sheet(submitter_id):
         for offset in range(0, 2000, batch_size):
             start = offset + 1
             end = offset + batch_size
-            # 一次性读取A:F列（避免逐行API调用）
-            range_str = f"A{start}:F{end}"
+            # 一次性读取A:L列（需要A、F、K列）
+            range_str = f"A{start}:L{end}"
             grid_data = read_sheet_range(SHEET_ID, range_str)
             rows = grid_data.get("rows", [])
             if not rows:
@@ -680,9 +716,9 @@ def _find_user_temp_row_in_sheet(submitter_id):
                 values = rows[i].get("values", [])
                 if not values:
                     continue
-                # A列：索引0，F列：索引5
                 a_val = ""
                 f_val = ""
+                k_val = ""
                 if len(values) > 0:
                     a_cv = values[0].get("cellValue")
                     if a_cv:
@@ -691,9 +727,17 @@ def _find_user_temp_row_in_sheet(submitter_id):
                     f_cv = values[5].get("cellValue")
                     if f_cv:
                         f_val = parse_cell_value(f_cv).strip()
+                if len(values) > 10:
+                    k_cv = values[10].get("cellValue")
+                    if k_cv:
+                        k_val = parse_cell_value(k_cv).strip()
 
+                # A列有数据，F列为空，K列为空或为该用户ID
                 if a_val and not f_val:
-                    return actual_row
+                    normalized_k = normalize_user_key(k_val)
+                    normalized_submitter = normalize_user_key(submitter_id)
+                    if not k_val or normalized_k == normalized_submitter:
+                        return actual_row
 
             if len(rows) < batch_size:
                 break
@@ -1172,7 +1216,7 @@ def cleanup_user_temp_rows():
 @require_auth
 def create_order():
     """创建订单：完整写入记录，不覆盖E列公式
-    使用calculate-date阶段已确定的行号，确保在同一行交互"""
+    提交时实时扫描A列找到真正的空行，避免多人并发时覆盖已有数据"""
     try:
         data = request.json
         model = data.get('model', '')
@@ -1182,24 +1226,53 @@ def create_order():
         queue_date = data.get('queue_date', '')
         submitter = data.get('submitter', '未知用户')
         submitter_id = data.get('submitter_id', '')
-        row_index = data.get('row_index', 0)  # 1-based，由calculate_date返回
 
         remark = f"{tonnage}{customer}"
         submit_time = get_beijing_time_str()
 
-        # 确定目标行
-        target_row = row_index
-        if target_row <= 0:
-            return jsonify({"success": False, "error": "未找到目标行，请先计算可发货日期"})
+        # 提交时实时扫描A列，找到第一个真正的空行（不使用缓存）
+        target_row = _find_first_empty_row_in_column_a()
 
-        # 检查目标行是否被当前用户的临时数据占用
-        temp_key = f"{submitter_id}"  # 不区分型号，同一用户复用同一临时行
-        with _temp_row_lock:
-            if temp_key in _temp_row_tracker:
-                tracked_row = _temp_row_tracker[temp_key]["row_index"]
-                if tracked_row != target_row:
-                    # 如果行号不一致，使用跟踪的行号
-                    target_row = tracked_row
+        if target_row is None:
+            # 表格已满，自动添加500行
+            url = f"{BASE_URL}/files/{FILE_ID}"
+            resp = HTTP.get(url, headers=get_headers(), timeout=_HTTP_TIMEOUT)
+            if resp.status_code == 200:
+                file_data = resp.json()
+                sheets = file_data.get("data", {}).get("sheets", [])
+                current_row_count = 0
+                for s in sheets:
+                    if s.get("sheetID") == SHEET_ID:
+                        current_row_count = s.get("rowCount", 0)
+                        break
+                if current_row_count <= 0:
+                    for s in sheets:
+                        if s.get("sheetID") == SHEET_ID:
+                            gp = s.get("gridProperties", {})
+                            current_row_count = gp.get("rowCount", 0)
+                            break
+                rows_to_add = 500
+                body = {
+                    "requests": [{
+                        "insertDimension": {
+                            "range": {
+                                "sheetID": SHEET_ID,
+                                "dimension": "ROWS",
+                                "startIndex": current_row_count + 1,
+                                "endIndex": current_row_count + 1 + rows_to_add
+                            }
+                        }
+                    }]
+                }
+                expand_resp = batch_update(body)
+                if expand_resp.status_code == 200:
+                    expand_result = expand_resp.json()
+                    if expand_result.get("ret") == 0 or "responses" in expand_result:
+                        _sheet_row_count_cache["count"] = current_row_count + rows_to_add
+                        target_row = current_row_count + 1
+
+            if target_row is None:
+                return jsonify({"success": False, "error": "表格已满且扩容失败，请联系管理员"})
 
         # 确保行数足够
         ensure_sheet_rows(target_row + 10)
@@ -1217,11 +1290,12 @@ def create_order():
             updated = result["responses"][0].get("updateRangeResponse", {}).get("updatedCells", 0)
             if updated > 0:
                 # 清理临时行跟踪
+                temp_key = f"{submitter_id}"
                 with _temp_row_lock:
                     if temp_key in _temp_row_tracker:
                         del _temp_row_tracker[temp_key]
                 clear_order_caches()
-                return jsonify({"success": True, "message": "订单创建成功"})
+                return jsonify({"success": True, "message": "订单创建成功", "row": target_row})
             return jsonify({"success": False, "error": "写入0个单元格"})
         else:
             err_str = json.dumps(result, ensure_ascii=False)

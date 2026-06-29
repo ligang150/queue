@@ -339,7 +339,8 @@ def _read_date_column(sheet_id, start_row, row_count):
 
 def get_sheet_data(sheet_id, start_row, capacity_col, limit_cell, row_count):
     """获取工作表数据 - 优先从预加载缓存读取
-    优化：只读取A列（日期）和产能列，避免读取中间列导致数据量过大"""
+    优化：只读取A列（日期）和产能列，避免读取中间列导致数据量过大
+    优化：预加载线程刚启动时，等待最多3秒让预加载完成，避免首次查询从API读取"""
     cache_key = f"{sheet_id}:{start_row}:{capacity_col}:{limit_cell}"
 
     # 1. 先检查后台预加载缓存（最快）
@@ -348,12 +349,25 @@ def get_sheet_data(sheet_id, start_row, capacity_col, limit_cell, row_count):
         if preloaded.get("date_capacity_map"):
             return preloaded
 
-    # 2. 再检查按需缓存
+    # 2. 如果预加载线程刚启动（5秒内），等待最多3秒让预加载完成
+    # 解决Render实例休眠后唤醒时，预加载线程与请求并行导致缓存未命中的问题
+    if _preload_thread is not None and _preload_thread.is_alive():
+        elapsed = time_module.time() - _preload_start_time
+        if elapsed < 5:
+            wait_time = min(3.0, 5.0 - elapsed)
+            print(f"[get_sheet_data] 预加载线程刚启动({elapsed:.1f}s)，等待{wait_time:.1f}s让预加载完成...", flush=True)
+            time_module.sleep(wait_time)
+            preloaded = _get_preloaded_data(cache_key)
+            if preloaded is not None and preloaded.get("date_capacity_map"):
+                print(f"[get_sheet_data] 等待后命中预加载缓存", flush=True)
+                return preloaded
+
+    # 3. 再检查按需缓存
     cached = _get_from_memory(cache_key)
     if cached is not None:
         return cached
 
-    # 3. 从腾讯API读取（三列并行读取，减少等待时间）
+    # 4. 从腾讯API读取（三列并行读取，减少等待时间）
     # 优化：日期列、产能列、上限日期并发读取，首次计算速度提升约60%
     end_row = start_row + row_count - 1
 
@@ -625,6 +639,7 @@ def clear_cache():
 # ========== 后台预抓取线程 ==========
 _preload_thread = None
 _preload_stop_event = threading.Event()
+_preload_start_time = 0  # 预加载线程启动时间戳，用于判断是否需要等待
 
 
 def _preload_single_model(model, config):
@@ -764,11 +779,12 @@ def _preload_worker():
 
 def start_preload_thread():
     """启动后台预抓取线程"""
-    global _preload_thread
+    global _preload_thread, _preload_start_time
     if _preload_thread is not None and _preload_thread.is_alive():
         return  # 已启动
 
     _preload_stop_event.clear()
+    _preload_start_time = time_module.time()
     _preload_thread = threading.Thread(target=_preload_worker, daemon=True)
     _preload_thread.start()
     print("[preload] 后台预抓取线程已启动", flush=True)

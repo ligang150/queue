@@ -236,8 +236,14 @@ _token_status = "unknown"
 _token_status_lock = threading.Lock()
 
 # 缓存TTL配置
-CACHE_TTL = 3600  # 1小时（按需缓存）
-PRELOAD_INTERVAL = 14400  # 后台每14400秒（4小时）预抓取一次，控制API调用量在2万/月以内
+CACHE_TTL = 900  # 15分钟（按需缓存）
+PRELOAD_INTERVAL = 900  # 高峰预加载间隔（15分钟），低峰3600秒（1小时）
+LOW_TRAFFIC_PRELOAD_INTERVAL = 3600  # 低峰预加载间隔（1小时）
+
+# 按工作表原始A列数据缓存（多个型号共享同一sheet的A列，减少API调用）
+_sheet_date_raw_cache = {}
+_sheet_date_raw_lock = threading.RLock()
+_SHEET_DATE_RAW_TTL = 900  # 15分钟，与预加载间隔一致
 
 
 def _set_token_status(status):
@@ -282,6 +288,24 @@ def _set_preload_cache(cache_key, data):
     """写入后台预抓取缓存"""
     with _preload_cache_lock:
         _preload_cache[cache_key] = {"data": data, "ts": time_module.time()}
+
+
+def _get_sheet_date_raw(sheet_id, start_row, row_count):
+    """获取工作表原始A列数据（多个型号共享）"""
+    cache_key = f"{sheet_id}:{start_row}:{row_count}"
+    with _sheet_date_raw_lock:
+        if cache_key in _sheet_date_raw_cache:
+            entry = _sheet_date_raw_cache[cache_key]
+            if time_module.time() - entry["ts"] < _SHEET_DATE_RAW_TTL:
+                return entry["data"]
+    return None
+
+
+def _set_sheet_date_raw(sheet_id, start_row, row_count, data):
+    """写入工作表原始A列数据"""
+    cache_key = f"{sheet_id}:{start_row}:{row_count}"
+    with _sheet_date_raw_lock:
+        _sheet_date_raw_cache[cache_key] = {"data": data, "ts": time_module.time()}
 
 
 def _read_date_column(sheet_id, start_row, row_count):
@@ -333,10 +357,13 @@ def get_sheet_data(sheet_id, start_row, capacity_col, limit_cell, row_count):
     # 例如C310：原来读A4:AD228=6750个单元格，现在读A4:A228+AD4:AD228=450个单元格
     end_row = start_row + row_count - 1
 
-    # 读取日期列（A列）
-    date_range = f"A{start_row}:A{end_row}"
-    date_grid = read_sheet_range(sheet_id, date_range)
-    date_rows = date_grid.get("rows", [])
+    # 读取日期列（A列）- 优先从工作表级原始缓存读取（多型号共享）
+    date_rows = _get_sheet_date_raw(sheet_id, start_row, row_count)
+    if date_rows is None:
+        date_range = f"A{start_row}:A{end_row}"
+        date_grid = read_sheet_range(sheet_id, date_range)
+        date_rows = date_grid.get("rows", [])
+        _set_sheet_date_raw(sheet_id, start_row, row_count, date_rows)
 
     # 读取产能列
     cap_range = f"{capacity_col}{start_row}:{capacity_col}{end_row}"
@@ -388,12 +415,12 @@ def get_sheet_data(sheet_id, start_row, capacity_col, limit_cell, row_count):
 
 # 上限日期缓存
 _limit_date_cache = {}
-_LIMIT_DATE_CACHE_TTL = 14400  # 4小时，与预加载间隔一致
+_LIMIT_DATE_CACHE_TTL = 1800  # 30分钟
 
 # 计算结果缓存（型号+吨位+期望日期 → 结果）
 _calc_result_cache = {}
 _calc_result_cache_lock = threading.Lock()
-_CALC_RESULT_CACHE_TTL = 600  # 10分钟
+_CALC_RESULT_CACHE_TTL = 300  # 5分钟
 
 # 空行缓存
 _empty_row_cache = {"row": 0, "timestamp": 0}
@@ -418,7 +445,7 @@ def _read_limit_date(sheet_id, limit_cell):
 # 配置表缓存
 _model_config_cache = {}
 _model_config_cache_time = 0
-MODEL_CONFIG_CACHE_TTL = 3600  # 1小时
+MODEL_CONFIG_CACHE_TTL = 1800  # 30分钟
 
 
 def _load_model_configs_from_sheet():
@@ -581,6 +608,8 @@ def clear_cache():
     _limit_date_cache.clear()
     _model_config_cache.clear()
     _model_config_cache_time = 0
+    with _sheet_date_raw_lock:
+        _sheet_date_raw_cache.clear()
 
 
 # ========== 后台预抓取线程 ==========
@@ -589,7 +618,8 @@ _preload_stop_event = threading.Event()
 
 
 def _preload_single_model(model, config):
-    """预抓取单个型号的产能数据"""
+    """预抓取单个型号的产能数据
+    优化：同一个工作表的A列被多个型号共享，优先从缓存读取"""
     try:
         sheet_id, start_row, capacity_col, limit_cell, row_count = config
         cache_key = f"{sheet_id}:{start_row}:{capacity_col}:{limit_cell}"
@@ -600,11 +630,15 @@ def _preload_single_model(model, config):
             return True, model, "已有缓存"
 
         end_row = start_row + row_count - 1
-        date_range = f"A{start_row}:A{end_row}"
         cap_range = f"{capacity_col}{start_row}:{capacity_col}{end_row}"
 
-        date_grid = read_sheet_range(sheet_id, date_range)
-        date_rows = date_grid.get("rows", [])
+        # 优先从工作表级A列缓存读取（多个型号共享）
+        date_rows = _get_sheet_date_raw(sheet_id, start_row, row_count)
+        if date_rows is None:
+            date_range = f"A{start_row}:A{end_row}"
+            date_grid = read_sheet_range(sheet_id, date_range)
+            date_rows = date_grid.get("rows", [])
+            _set_sheet_date_raw(sheet_id, start_row, row_count, date_rows)
 
         cap_grid = read_sheet_range(sheet_id, cap_range)
         cap_rows = cap_grid.get("rows", [])
@@ -696,10 +730,12 @@ def _preload_worker():
         except Exception as e:
             print(f"[preload] 预抓取异常: {e}", flush=True)
 
-        # 根据北京时间决定等待间隔：白天(7-22点)120秒，夜间600秒
-        # 增大间隔减少API调用频率，避免token问题时大量请求
+        # 根据北京时间动态调整间隔：高峰(7-22点)15分钟，低峰1小时
+        # 额度2万次/天，高峰每15分钟预加载约38次API（按工作表共享A列后）
+        # 白天60轮×38=2280次，夜间9轮×38=342次，总计约2622次/天
         hour = datetime.now().hour
-        wait_seconds = 120 if 7 <= hour < 22 else 600
+        wait_seconds = PRELOAD_INTERVAL if 7 <= hour < 22 else LOW_TRAFFIC_PRELOAD_INTERVAL
+        print(f"[preload] 下次预加载等待 {wait_seconds} 秒（当前北京时间 {hour} 点）", flush=True)
         _preload_stop_event.wait(wait_seconds)
 
 

@@ -236,14 +236,14 @@ _token_status = "unknown"
 _token_status_lock = threading.Lock()
 
 # 缓存TTL配置
-CACHE_TTL = 900  # 15分钟（按需缓存）
-PRELOAD_INTERVAL = 900  # 高峰预加载间隔（15分钟），低峰3600秒（1小时）
-LOW_TRAFFIC_PRELOAD_INTERVAL = 3600  # 低峰预加载间隔（1小时）
+CACHE_TTL = 300  # 5分钟（按需缓存）
+PRELOAD_INTERVAL = 150  # 高峰预加载间隔（2.5分钟），低峰900秒（15分钟）
+LOW_TRAFFIC_PRELOAD_INTERVAL = 900  # 低峰预加载间隔（15分钟）
 
 # 按工作表原始A列数据缓存（多个型号共享同一sheet的A列，减少API调用）
 _sheet_date_raw_cache = {}
 _sheet_date_raw_lock = threading.RLock()
-_SHEET_DATE_RAW_TTL = 900  # 15分钟，与预加载间隔一致
+_SHEET_DATE_RAW_TTL = 150  # 2.5分钟，与高峰预加载间隔一致
 
 
 def _set_token_status(status):
@@ -415,12 +415,12 @@ def get_sheet_data(sheet_id, start_row, capacity_col, limit_cell, row_count):
 
 # 上限日期缓存
 _limit_date_cache = {}
-_LIMIT_DATE_CACHE_TTL = 1800  # 30分钟
+_LIMIT_DATE_CACHE_TTL = 300  # 5分钟
 
 # 计算结果缓存（型号+吨位+期望日期 → 结果）
 _calc_result_cache = {}
 _calc_result_cache_lock = threading.Lock()
-_CALC_RESULT_CACHE_TTL = 300  # 5分钟
+_CALC_RESULT_CACHE_TTL = 120  # 2分钟
 
 # 空行缓存
 _empty_row_cache = {"row": 0, "timestamp": 0}
@@ -445,7 +445,7 @@ def _read_limit_date(sheet_id, limit_cell):
 # 配置表缓存
 _model_config_cache = {}
 _model_config_cache_time = 0
-MODEL_CONFIG_CACHE_TTL = 1800  # 30分钟
+MODEL_CONFIG_CACHE_TTL = 600  # 10分钟
 
 
 def _load_model_configs_from_sheet():
@@ -730,9 +730,9 @@ def _preload_worker():
         except Exception as e:
             print(f"[preload] 预抓取异常: {e}", flush=True)
 
-        # 根据北京时间动态调整间隔：高峰(7-22点)15分钟，低峰1小时
-        # 额度2万次/天，高峰每15分钟预加载约38次API（按工作表共享A列后）
-        # 白天60轮×38=2280次，夜间9轮×38=342次，总计约2622次/天
+        # 根据北京时间动态调整间隔：高峰(7-22点)2.5分钟，低峰15分钟
+        # 目标日均约15000次API调用，按工作表共享A列后每轮约38次
+        # 白天360轮×38=13680次，夜间36轮×38=1368次，总计约15048次/天
         hour = datetime.now().hour
         wait_seconds = PRELOAD_INTERVAL if 7 <= hour < 22 else LOW_TRAFFIC_PRELOAD_INTERVAL
         print(f"[preload] 下次预加载等待 {wait_seconds} 秒（当前北京时间 {hour} 点）", flush=True)

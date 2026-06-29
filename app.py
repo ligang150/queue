@@ -457,7 +457,8 @@ def get_next_empty_row(sheet_id, start_from=2, max_batches=4):
     """获取表格下一个空行号（1-based），从A列第一个空行开始扫描（跳过表头第1行）
     优化：增大批次到500行，减少API调用次数；添加30秒缓存
     安全：start_from 参数允许调用方指定从哪行开始扫描，避免多人并发时依赖全局缓存
-    快速失败：API无响应时立即返回默认行号，避免阻塞请求"""
+    快速失败：API无响应时立即返回默认行号，避免阻塞请求
+    修复：当 len(rows) < batch_size 时，验证候选行是否为空；若候选行已有数据（API压缩格式导致），逐行扫描精确定位第一个空行"""
     global _empty_row_cache
     now = time.time()
     # 缓存命中：30秒内直接返回缓存的空行位置
@@ -497,11 +498,22 @@ def get_next_empty_row(sheet_id, start_from=2, max_batches=4):
                 _empty_row_cache = {"row": actual_row, "timestamp": now}
                 return actual_row
 
-        # 返回数据不足一个批次，说明已到表格末尾，下一行就是空行
+        # 返回数据不足一个批次，可能是已到表格末尾，也可能是中间有空行（API压缩格式）
         if len(rows) < batch_size:
-            actual_row = start + len(rows)
-            _empty_row_cache = {"row": actual_row, "timestamp": now}
-            return actual_row
+            candidate = start + len(rows)
+            # 验证候选行是否真的是空的（防御API压缩格式导致行号计算错误）
+            cell_val = read_single_cell(sheet_id, f"A{candidate}")
+            if not cell_val or not cell_val.strip():
+                _empty_row_cache = {"row": candidate, "timestamp": now}
+                return candidate
+            # 候选行已有数据，说明中间有空行，逐行扫描该范围精确定位
+            for row_num in range(start, candidate + 1):
+                cell_val = read_single_cell(sheet_id, f"A{row_num}")
+                if not cell_val or not cell_val.strip():
+                    _empty_row_cache = {"row": row_num, "timestamp": now}
+                    return row_num
+            # 该批次内没找到空行，继续下一批
+            continue
 
     # 扫描失败或达到上限，返回一个安全的默认行号
     default_row = start_from
@@ -511,7 +523,8 @@ def get_next_empty_row(sheet_id, start_from=2, max_batches=4):
 
 def _find_first_empty_row_in_column_a():
     """提交排队时实时扫描A列，找到第一个真正的空行（1-based）
-    不使用缓存，每次都是最新数据。API失败自动重试，最终失败时返回None让调用方扩容"""
+    不使用缓存，每次都是最新数据。API失败自动重试，最终失败时返回None让调用方扩容
+    修复：当 len(rows) < batch_size 时，验证候选行是否为空；若候选行已有数据（API压缩格式导致），逐行扫描精确定位第一个空行"""
     batch_size = 100
     max_retries = 2
 
@@ -556,9 +569,20 @@ def _find_first_empty_row_in_column_a():
                 if not has_data:
                     return actual_row
 
+            # 返回数据不足一个批次，可能是已到表格末尾，也可能是中间有空行（API压缩格式）
             if len(rows) < batch_size:
-                # 到达表格末尾，下一行是空行
-                return start + len(rows)
+                candidate = start + len(rows)
+                # 验证候选行是否真的是空的（防御API压缩格式导致行号计算错误）
+                cell_val = read_single_cell(SHEET_ID, f"A{candidate}")
+                if not cell_val or not cell_val.strip():
+                    return candidate
+                # 候选行已有数据，说明中间有空行，逐行扫描该范围精确定位
+                for row_num in range(start, candidate + 1):
+                    cell_val = read_single_cell(SHEET_ID, f"A{row_num}")
+                    if not cell_val or not cell_val.strip():
+                        return row_num
+                # 该批次内没找到空行，继续下一批
+                continue
 
         # 所有批次扫描完毕，没找到空行
         if all_batches_empty and attempt < max_retries:
@@ -639,8 +663,8 @@ def ensure_sheet_rows(min_row_count):
                         "range": {
                             "sheetID": SHEET_ID,
                             "dimension": "ROWS",
-                            "startIndex": current_row_count + 1,
-                            "endIndex": current_row_count + 1 + rows_to_add
+                            "startIndex": current_row_count,
+                            "endIndex": current_row_count + rows_to_add
                         }
                     }
                 }]
@@ -1288,8 +1312,8 @@ def create_order():
                                         "range": {
                                             "sheetID": SHEET_ID,
                                             "dimension": "ROWS",
-                                            "startIndex": current_row_count + 1,
-                                            "endIndex": current_row_count + 1 + rows_to_add
+                                            "startIndex": current_row_count,
+                                            "endIndex": current_row_count + rows_to_add
                                         }
                                     }
                                 }]
